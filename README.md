@@ -1,67 +1,89 @@
-# Why small reasoning models can't stop: loops and self-doubt in Qwen3.5-0.8B
+# inside-the-loop: why small reasoning models can't stop
 
-> **Work in progress.** This is an early-stage research project, started November 2026.
+> **Work in progress.** An early-stage research project, started November 2026.
 
 ## Motivation
 
-A recent report on **weight-space programming** (Takehi et al.) showed a frontier model editing the weights of a small open model directly, with no gradient descent. It raised Qwen3.5-0.8B's MATH-500 accuracy from 7.9% to 48.1% by changing about 0.016% of its weights, reportedly by stopping the model's reasoning loops.
+A recent report on **weight-space programming** (Takehi et al., MIT CSAIL, Nov 2026) showed a frontier model editing the weights of a small open model directly, with no gradient descent. It raised Qwen3.5-0.8B's MATH-500 accuracy from 7.9% to 48.1% by changing about 0.016% of its weights, mostly by stopping the model's reasoning loops. The edit targeted the MLPs of layers 15 and 19.
 
-This project starts by reproducing and measuring that failure mode myself. The longer-term goal is to look *inside* the model to find what drives it, using interpretability tools (hooks, logit lens, ablations), and to build a small harness of agents that each investigate a different part of the model.
+This project starts by reproducing and measuring that failure mode myself. The next step is to look *inside* the model to find what drives it, using interpretability tools (hooks, logit lens, ablations), and later to build a small harness of agents that each investigate a different part of the model.
 
 ## Setup
 
 | | |
 |---|---|
 | Model | `Qwen/Qwen3.5-0.8B` (Hugging Face Transformers, float16) |
+| Mode | **non-thinking** (the default chat template pre-fills an empty `<think></think>` block) |
 | Hardware | Kaggle free tier, NVIDIA T4 |
 | Benchmark | [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500), first 10 problems from each difficulty level (50 total) |
-| Prompt | the problem + `Please reason step by step, and put your final answer within \boxed{}.` |
+| Prompt | the problem + a new line + `reason step by step, and put your final answer within \boxed{}` |
 | Budget | `max_new_tokens = 2000` |
 | Decoding | model defaults (outputs were identical across repeated runs) |
 
-## What's in the notebook
+**Note:** the WSP paper used *thinking* mode with a 32,768-token budget. These numbers are not directly comparable to theirs.
 
-- **Loop detector (`detect_loop`)**: slides a window over the answer and counts repeated word chunks (n-grams). Flags a loop if any 15-word chunk appears 2 or more times.
-- **Early stopper (`LoopStopper`)**: a custom Hugging Face `StoppingCriteria` that runs the detector every 50 generated tokens and ends generation if it fires.
-- **Auto-grader**: pulls the final answer out of the last `\boxed{...}` (with brace matching) and compares it to the reference after light normalisation.
-- **Self-doubt counter**: counts a fixed list of phrases in each answer: `wait`, `double check`, `double-check`, `re-verify`, `re-read`, `let me check`, `actually`.
+## Method
 
-## Results so far (50 problems)
+- **Auto-grader**: pulls the final answer out of the last `\boxed{...}` (with brace matching) and compares it to the reference after light normalisation. Every "wrong" answer was also checked by hand.
+- **Repetition measure**: word-level n-gram repetition. Flags an answer if any 15-word chunk appears 2 or more times. Measured *after* generation; it never interrupts the model.
+- **Self-doubt counter**: counts a fixed list of phrases: `wait`, `double check`, `double-check`, `re-verify`, `re-read`, `let me check`, `actually`.
+- **"Hit cap"**: the answer used the full 2000 tokens without finishing. Used as the measure of "stuck".
 
-| Level | Correct | Finished | Hit 2000-token cap | Stopper fired |
-|---|---|---|---|---|
-| 1 | 6 | 8 | 2 | 0 |
-| 2 | 4 | 7 | 0 | 3 |
-| 3 | 4 | 8 | 1 | 1 |
-| 4 | 3 | 5 | 2 | 3 |
-| 5 | 0 | 2 | 2 | 6 |
-| **Total** | **17 (34%)** | **30** | **7** | **13** |
+## Results: clean baseline (50 problems, nothing interrupting generation)
 
-(The auto-grader scored 16; one more was correct but written in a different form, `11\sqrt2` vs `11\sqrt{2}`.)
+| Level | Correct | Finished | Hit cap |
+|---|---|---|---|
+| 1 | 6 | 8 | 2 |
+| 2 | 5 | 9 | 1 |
+| 3 | 4 | 8 | 2 |
+| 4 | 3 | 6 | 4 |
+| 5 | 1 | 3 | 7 |
+| **Total** | **19 (38%)** | **34** | **16 (32%)** |
 
-**Key observations:**
+(The auto-grader scored 18. One more, problem #23, answered `5` where the reference is `x=5`, and was marked correct by hand.)
 
-1. **40% of problems never produced a final answer.** This happened even on level 1, the easiest problems.
-2. **Spirals often start after the model already has the right answer.** A typical pattern: reach an answer, then "Wait, let me double check…", then go round in circles until the budget runs out.
-3. **Self-doubt phrases separate stuck answers from finished ones.** They appear about 1.71 times per 1000 tokens in answers that hit the cap, against 0.10 per 1000 in answers that finished (roughly 17×). No finished answer contained more than one; 6 of the 7 cap cases contained two or more.
+### Key observations
+
+1. **32% of problems never produce a final answer**, even in non-thinking mode, and including the easiest (level 1) problems.
+2. **The model often reaches the right answer, then talks itself out of it.** A typical pattern: correct intermediate result, then "Wait, let me double check…", then circling until the budget runs out.
+3. **There are two distinct ways to get stuck:**
+   - **Self-doubt spirals** (10 of the 16 stuck answers): repeated second-guessing in changing words.
+   - **Mechanical repetition** (4 of the 16): no self-doubt at all; the model copies a pattern over and over (one answer repeats the same line 20+ times).
+   - The remaining 2 stuck answers show a bit of both and don't fit cleanly into either type.
+4. **Each failure type is caught by a different simple signal:**
+
+| Signal (measured after generation) | Stuck answers caught (of 16) | False alarms on finished answers (of 34) |
+|---|---|---|
+| 15-gram repetition | 9 | 4 |
+| 2+ self-doubt phrases | 10 | 1 |
+| **Either signal** | **15** | **4** |
+
+Self-doubt phrases appear about **1.28 per 1000 tokens** in stuck answers against **0.20** in finished ones (about 6×).
+
+### An earlier run, with a live early-stopper
+
+A first run stopped generation whenever the repetition detector fired. Comparing it with the clean run, the stopper was right 9 out of 13 times, but it **cut off two answers that would have been correct**, and it missed a loop where each repetition differed slightly. That's why the clean baseline above measures repetition only after the fact.
 
 ## Known limitations
 
-- **The loop detector is unreliable.** It produced false positives, stopping answers early on legitimately repeated phrasing; two of those were on track to be correct. It also missed a clear loop where each repetition differed slightly. So the "Stopper fired" column means *the detector triggered*, not a verified loop, and 34% accuracy is probably an underestimate. The hit-cap and self-doubt results don't depend on the detector.
 - **Small sample.** 50 problems; every number here has wide uncertainty.
-- **Phrase list chosen by eye.** It was picked after reading an initial 10 problems, then fixed before the 50-problem run. Those 10 are included in the 50, so the test isn't fully independent.
-- **Correlation, not cause.** Self-doubt may cause the spirals, or may be a symptom of already being stuck. Only an intervention on the model can tell these apart.
-- **Simple grader.** Equivalent answers written differently can be marked wrong.
+- **"Hit cap" is a proxy for "stuck"**, not a hand label. Some long answers might have finished with a bigger budget.
+- **Phrase list chosen by eye.** It was picked after reading an initial 10 problems, which are included in these 50.
+- **Correlation, not cause.** Self-doubt may cause the spirals, or be a symptom of already being stuck. Only an intervention on the model can tell these apart.
+- **Simple grader.** Equivalent answers written differently can be marked wrong; all mismatches were checked by hand.
 
 ## Next steps
 
-- [ ] Re-run the baseline **without** the early stopper, so measurement isn't contaminated by it
-- [ ] Validate the loop detector against hand-labelled answers (precision and recall), and make it robust to near-duplicates
-- [ ] Use hooks and the logit lens to find which layers push the model towards self-doubt tokens like "Wait"
-- [ ] Ablate candidate layers and attention heads, and measure the change in cap rate and doubt rate
-- [ ] Build a small harness of agents that each investigate different layers, and compare their suggested edits against random edits of the same size
+- [x] Reproduce the looping and build an evaluation pipeline
+- [x] Clean baseline without the early-stopper
+- [ ] Use hooks and the logit lens to see what layers 15 and 19 (the WSP edit sites) do when the model writes "Wait"
+- [ ] Ablate candidate layers and heads, and measure the change in cap rate and self-doubt rate
+- [ ] Test the WSP-edited checkpoint in non-thinking mode: does a fix found for thinking-mode loops also stop self-doubt spirals and mechanical repetition?
+- [ ] Small thinking-mode comparison run
+- [ ] Build a harness of agents that each investigate different layers, and compare their edits against random edits of the same size
 
 ## Files
 
-- `wsp-harness.ipynb`: the notebook (setup, detector, stopper, grader, batch run, summary)
-- `batch_results_50.json`: every problem's text, full model output, ending, grade and doubt count
+- `wsp-math500.ipynb`: the notebook for the clean baseline (setup, repetition measure, grader, batch run, summary). Cell outputs are not included; all results are in the JSON files below. The earlier early-stopper run used the same code with the two `LoopStopper` lines in the batch cell switched back on.
+- `results/batch_results_50_nostop.json`: the clean baseline. Every problem's text, full model output, ending, grade, doubt count and repetition stats
+- `results/batch_results_50_stopper.json`: the earlier run with the live early-stopper
